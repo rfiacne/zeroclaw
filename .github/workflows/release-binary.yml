@@ -1,0 +1,256 @@
+name: Release Binary
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.2.0, optional when triggered by tag)"
+        required: false
+        type: string
+  # Tag 推送触发
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-binary-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  resolve-version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from input or tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 优先使用手动输入的版本号
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+            tag="v${version}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # 从 tag 提取版本号
+            tag="${GITHUB_REF#refs/tags/}"
+            version="${tag#v}"
+          else
+            # 使用 Cargo.toml 版本 + run number
+            base_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+            version="${base_version}"
+            tag="v${base_version}-build.${GITHUB_RUN_NUMBER}"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=${version}, tag=${tag}"
+
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [resolve-version, web]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: zeroclaw
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: zeroclaw.exe
+            ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Windows'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify binary exists
+        shell: bash
+        run: |
+          echo "=== Checking binary in target directory ==="
+          ls -la target/${{ matrix.target }}/release/ | head -20
+          if [ -f "target/${{ matrix.target }}/release/${{ matrix.artifact }}" ]; then
+            echo "✅ Binary found: ${{ matrix.artifact }}"
+            file "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          else
+            echo "❌ Binary NOT found: ${{ matrix.artifact }}"
+            exit 1
+          fi
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          cd ../../..
+          echo "=== Checking packaged file ==="
+          ls -la zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          cd ../../..
+          echo "=== Checking packaged file ==="
+          ls -la zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: [resolve-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zeroclaw-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Artifacts directory structure ==="
+          find artifacts -type f -ls
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          # 将所有压缩包复制到 release-files 目录
+          find artifacts -name '*.tar.gz' -exec cp {} release-files/ \;
+          find artifacts -name '*.zip' -exec cp {} release-files/ \;
+          echo "=== Release files ==="
+          ls -la release-files/
+
+      - name: Generate checksums
+        run: |
+          cd release-files
+          sha256sum * > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          name: ${{ needs.resolve-version.outputs.tag }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
+          files: release-files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Push Docker Image
+    needs: [resolve-version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
